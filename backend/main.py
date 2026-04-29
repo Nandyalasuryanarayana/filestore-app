@@ -8,12 +8,14 @@ app = FastAPI(title="FileStore API")
 
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "/data/uploads"))
 MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "50"))
+# FRONTEND_URL injected by Vault Agent — locks CORS to the known frontend origin
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://filestore.interndevops.cloud")
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[FRONTEND_URL],
     allow_methods=["*"],
     allow_headers=["*"],
 )

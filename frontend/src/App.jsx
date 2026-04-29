@@ -3,7 +3,7 @@ import FileUpload from './components/FileUpload'
 import FileList from './components/FileList'
 import './App.css'
 
-const API = '/api'
+const API = 'https://api.filestore.interndevops.cloud'
 
 export default function App() {
   const [files, setFiles] = useState([])
