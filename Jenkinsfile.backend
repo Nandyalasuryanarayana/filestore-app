@@ -1,0 +1,172 @@
+def vaultLogin() {
+    withCredentials([usernamePassword(credentialsId: 'vault-readonly-credentials', usernameVariable: 'VAULT_USER', passwordVariable: 'VAULT_PASS')]) {
+        sh """
+            export VAULT_ADDR=${VAULT_ADDR}
+            vault login -method=userpass username=\${VAULT_USER} password=\${VAULT_PASS} > /dev/null 2>&1
+        """
+    }
+}
+
+pipeline {
+    agent { label '' }
+    options {
+        timeout(time: 1, unit: 'HOURS')
+    }
+    environment {
+        VAULT_ADDR    = "http://vault-alb-1622424741.ap-south-1.elb.amazonaws.com"
+        SERVICE       = "filestore-backend"
+        BUILD_CONTEXT = "backend"
+        HELM_DIR      = "filestore_backend_charts"
+        HELM_BRANCH   = "filestore-backend"
+        ENV_PATH      = "kv/projects/filestore/backend"
+        IMAGE_TAG     = "${env.BUILD_ID}"
+    }
+    parameters {
+        string(name: 'SCM_URL',  defaultValue: 'https://github.com/Nandyalasuryanarayana/filestore-app.git', description: 'App source repo')
+        string(name: 'HELM_REPO', defaultValue: 'https://github.com/Nandyalasuryanarayana/project_1.git',   description: 'Helm charts repo')
+        choice(name: 'BRANCH',   choices: ['main'], description: 'Branch to build')
+    }
+
+    stages {
+
+        stage('Clean Workspace') {
+            steps { cleanWs() }
+        }
+
+        stage('SCM') {
+            steps {
+                git(url: "${params.SCM_URL}", branch: "${params.BRANCH}", credentialsId: 'cicd-git-token')
+            }
+        }
+
+        stage('Set Image Tag') {
+            steps {
+                script {
+                    env.LATEST_COMMIT_SHORT = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
+                    env.IMAGE_TAG = "${BUILD_NUMBER}-${env.LATEST_COMMIT_SHORT}"
+                    echo "Image tag: ${env.IMAGE_TAG}"
+                }
+            }
+        }
+
+        stage('Fetch App Secrets from Vault') {
+            steps {
+                script { vaultLogin() }
+                withVault(configuration: [engineVersion: 2, skipSslVerification: true, timeout: 60, vaultUrl: "${VAULT_ADDR}"],
+                    vaultSecrets: [[path: "${ENV_PATH}", secretValues: [
+                        [vaultKey: 'FRONTEND_URL',       envVar: 'FRONTEND_URL'],
+                        [vaultKey: 'MAX_UPLOAD_SIZE_MB', envVar: 'MAX_UPLOAD_SIZE_MB'],
+                        [vaultKey: 'API_SECRET_KEY',     envVar: 'API_SECRET_KEY']
+                    ]]]) {
+                    sh "echo Fetched secrets for ${SERVICE}"
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                withVault(configuration: [engineVersion: 2, skipSslVerification: true, timeout: 60, vaultUrl: "${VAULT_ADDR}"],
+                    vaultSecrets: [[path: 'kv/projects/filestore/cicd', secretValues: [
+                        [vaultKey: 'DOCKERHUB_USER', envVar: 'DOCKERHUB_USER']
+                    ]]]) {
+                    sh "docker build -t \$DOCKERHUB_USER/${SERVICE}:${env.IMAGE_TAG} ${BUILD_CONTEXT}/"
+                }
+            }
+        }
+
+        stage('Push Docker Image') {
+            steps {
+                withVault(configuration: [engineVersion: 2, skipSslVerification: true, timeout: 60, vaultUrl: "${VAULT_ADDR}"],
+                    vaultSecrets: [[path: 'kv/projects/filestore/cicd', secretValues: [
+                        [vaultKey: 'DOCKERHUB_USER',  envVar: 'DOCKERHUB_USER'],
+                        [vaultKey: 'DOCKERHUB_TOKEN', envVar: 'DOCKERHUB_TOKEN']
+                    ]]]) {
+                    sh """
+                        docker login -u \$DOCKERHUB_USER -p \$DOCKERHUB_TOKEN
+                        docker push \$DOCKERHUB_USER/${SERVICE}:${env.IMAGE_TAG}
+                        docker rmi  \$DOCKERHUB_USER/${SERVICE}:${env.IMAGE_TAG}
+                    """
+                }
+            }
+        }
+
+        stage('Clone Helm Charts') {
+            steps {
+                withVault(configuration: [engineVersion: 2, skipSslVerification: true, timeout: 60, vaultUrl: "${VAULT_ADDR}"],
+                    vaultSecrets: [[path: 'kv/projects/filestore/cicd', secretValues: [
+                        [vaultKey: 'GIT_TOKEN', envVar: 'GIT_TOKEN']
+                    ]]]) {
+                    dir("${HELM_DIR}") {
+                        git(url: "${params.HELM_REPO}", branch: "${HELM_BRANCH}", credentialsId: 'cicd-git-token')
+                    }
+                }
+            }
+        }
+
+        stage('Update Helm Chart Version') {
+            steps {
+                withVault(configuration: [engineVersion: 2, skipSslVerification: true, timeout: 60, vaultUrl: "${VAULT_ADDR}"],
+                    vaultSecrets: [[path: 'kv/projects/filestore/cicd', secretValues: [
+                        [vaultKey: 'GIT_USER',  envVar: 'GIT_USER'],
+                        [vaultKey: 'GIT_TOKEN', envVar: 'GIT_TOKEN']
+                    ]]]) {
+                    sh """
+                        cd ${HELM_DIR}
+                        sed -E -i 's/appVersion: .+/appVersion: "${env.IMAGE_TAG}"/' Chart.yaml
+                        git add Chart.yaml
+                        git commit -m 'ci: update ${SERVICE} image to ${env.IMAGE_TAG}'
+                        git push https://\${GIT_USER}:\${GIT_TOKEN}@github.com/Nandyalasuryanarayana/project_1.git
+                    """
+                }
+            }
+        }
+
+        stage('Sync ArgoCD App') {
+            steps {
+                withVault(configuration: [engineVersion: 2, skipSslVerification: true, timeout: 60, vaultUrl: "${VAULT_ADDR}"],
+                    vaultSecrets: [[path: 'kv/projects/filestore/cicd', secretValues: [
+                        [vaultKey: 'ARGOCD_SERVER',   envVar: 'ARGOCD_SERVER'],
+                        [vaultKey: 'ARGOCD_USERNAME', envVar: 'ARGOCD_USERNAME'],
+                        [vaultKey: 'ARGOCD_PASSWORD', envVar: 'ARGOCD_PASSWORD']
+                    ]]]) {
+                    sh "argocd login --grpc-web \$ARGOCD_SERVER --username \$ARGOCD_USERNAME --password \$ARGOCD_PASSWORD --insecure"
+                }
+                sh "argocd app sync ${SERVICE}"
+            }
+        }
+
+        stage('Wait for ArgoCD Health') {
+            steps {
+                script {
+                    def retries    = 0
+                    def maxRetries = 40
+                    def healthStatus = 'Progressing'
+
+                    while (healthStatus == 'Progressing' && retries < maxRetries) {
+                        def appJson = sh(returnStdout: true, script: "argocd app get ${SERVICE} -o json").trim()
+                        def json    = readJSON text: appJson
+                        healthStatus = json.status.health.status.trim()
+
+                        if (healthStatus == 'Progressing') {
+                            echo "Status: Progressing — waiting..."
+                            sleep time: 5, unit: 'SECONDS'
+                            retries++
+                        }
+                    }
+
+                    if (healthStatus == 'Healthy') {
+                        echo "Deployment Healthy."
+                    } else {
+                        currentBuild.result = 'FAILURE'
+                        error "Deployment failed — ArgoCD health: ${healthStatus}"
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success { echo "Pipeline succeeded — ${SERVICE}:${env.IMAGE_TAG} deployed." }
+        failure { echo "Pipeline failed — check stage logs above." }
+    }
+}
